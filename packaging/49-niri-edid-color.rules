@@ -1,0 +1,24 @@
+/*
+ * Permit an active local desktop session to invoke only the fixed, root-owned
+ * panel apply/reset wrappers. The wrappers ignore all arguments and the helper
+ * itself remains locked to one connector and one exact 128-byte EDID.
+ */
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.policykit.exec" ||
+        action.lookup("user") !== "root" || !subject.local) {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    var program = action.lookup("program");
+    if (program === "/usr/local/libexec/niri-edid-color-apply" &&
+        subject.active) {
+        return polkit.Result.YES;
+    }
+
+    /* Logout cleanup can happen just after the session becomes inactive. */
+    if (program === "/usr/local/libexec/niri-edid-color-reset") {
+        return polkit.Result.YES;
+    }
+
+    return polkit.Result.NOT_HANDLED;
+});

@@ -1,0 +1,4 @@
+#!/bin/sh
+
+# Deliberately ignore caller-supplied arguments. This is a fixed Polkit action.
+exec /usr/local/libexec/niri-edid-color apply --takeover

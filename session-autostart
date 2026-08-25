@@ -1,0 +1,132 @@
+#!/bin/sh
+
+# Keep the two halves of the panel correction together for one niri session.
+# This file runs as the desktop user. Only the fixed, root-owned apply/reset
+# wrappers invoked through pkexec are privileged.
+
+set -u
+
+project_dir=/home/thomas/code/github.com/uhthomas/niri-edid-color
+helper=/usr/local/libexec/niri-edid-color
+apply_action=/usr/local/libexec/niri-edid-color-apply
+reset_action=/usr/local/libexec/niri-edid-color-reset
+gamma_config="$project_dir/gammastep-regamma.ini"
+gamma_pid=
+pid_file=
+applied=0
+cleaning=0
+
+log()
+{
+    printf '%s\n' "niri-edid-color: $*" >&2
+}
+
+cleanup()
+{
+    exit_status=$?
+
+    if [ "$cleaning" -eq 1 ]; then
+        return
+    fi
+    cleaning=1
+    trap - EXIT HUP INT TERM
+
+    # Reset the linear-light stages before removing the final gamma curve.
+    if [ "$applied" -eq 1 ]; then
+        if ! /usr/bin/pkexec --disable-internal-agent "$reset_action"; then
+            log "WARNING: automatic reset failed; reboot clears the volatile KMS state"
+            exit_status=1
+        fi
+        applied=0
+    fi
+
+    if [ -n "$gamma_pid" ] && kill -0 "$gamma_pid" 2>/dev/null; then
+        kill -TERM "$gamma_pid" 2>/dev/null || true
+        wait "$gamma_pid" 2>/dev/null || true
+    fi
+
+    if [ -n "$pid_file" ]; then
+        rm -f -- "$pid_file"
+    fi
+
+    exit "$exit_status"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+if [ ! -x "$helper" ] || [ ! -x "$apply_action" ] || [ ! -x "$reset_action" ]; then
+    log "the root-owned helper is not installed"
+    exit 1
+fi
+
+if [ ! -r "$gamma_config" ]; then
+    log "missing GammaStep configuration: $gamma_config"
+    exit 1
+fi
+
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    log "XDG_RUNTIME_DIR is not set"
+    exit 1
+fi
+
+# Keep diagnostics session-local; this directory disappears at logout/reboot.
+log_file="$XDG_RUNTIME_DIR/niri-edid-color.log"
+exec >"$log_file" 2>&1
+log "starting with WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}"
+
+# A config reload or accidental duplicate startup must not create two clients.
+lock_file="$XDG_RUNTIME_DIR/niri-edid-color.lock"
+exec 9>"$lock_file"
+if ! /usr/bin/flock -n 9; then
+    log "already running for this session"
+    exit 0
+fi
+
+pid_file="$XDG_RUNTIME_DIR/niri-edid-color.pid"
+printf '%s\n' "$$" >"$pid_file"
+
+/usr/bin/gammastep -v -c "$gamma_config" &
+gamma_pid=$!
+
+# Do not take DRM master until GammaStep has installed the final curve. Applying
+# DEGAMMA without that curve would make the desktop temporarily very dark.
+ready=0
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    if ! kill -0 "$gamma_pid" 2>/dev/null; then
+        wait "$gamma_pid" 2>/dev/null
+        gamma_status=$?
+        gamma_pid=
+        log "GammaStep exited before its gamma curve became active (status $gamma_status)"
+        exit 1
+    fi
+
+    kms_status=$($helper status 2>/dev/null || true)
+    case "$kms_status" in
+        *"GAMMA_LUT:"*"owned externally"*)
+            ready=1
+            break
+            ;;
+    esac
+
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+
+if [ "$ready" -ne 1 ]; then
+    log "GammaStep did not install its gamma curve within 10 seconds"
+    exit 1
+fi
+
+if ! /usr/bin/pkexec --disable-internal-agent "$apply_action"; then
+    log "could not apply the EDID colour transform"
+    exit 1
+fi
+applied=1
+log "EDID colour correction is active"
+
+wait "$gamma_pid"
+gamma_status=$?
+gamma_pid=
+log "GammaStep exited (status $gamma_status)"
+exit "$gamma_status"
